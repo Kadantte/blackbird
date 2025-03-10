@@ -1,221 +1,169 @@
-import argparse
-import asyncio
-import json
 import os
-import random
-import subprocess
+import argparse
+from rich.console import Console
+import logging
 import sys
-import time
-import warnings
-import csv
 from datetime import datetime
 
-import aiohttp
-from bs4 import BeautifulSoup
-from colorama import Fore, init
+sys.path.append(os.path.join(os.path.dirname(__file__), "src"))
 
-file = open("data.json")
-searchData = json.load(file)
-currentOs = sys.platform
-path = os.path.dirname(__file__)
-warnings.filterwarnings("ignore")
+import config
+from modules.whatsmyname.list_operations import checkUpdates
+from modules.core.username import verifyUsername
+from modules.core.email import verifyEmail
+from modules.utils.userAgent import getRandomUserAgent
+from modules.export.file_operations import createSaveDirectory
+from modules.export.csv import saveToCsv
+from modules.export.pdf import saveToPdf
+from modules.utils.file_operations import isFile, getLinesFromFile
+from modules.utils.permute import Permute
+from modules.ner.entity_extraction import inialize_nlp_model
+from dotenv import load_dotenv
 
-useragents = open("useragents.txt").read().splitlines()
-proxy = None
+load_dotenv()
 
 
-async def findUsername(username, interfaceType, flag_csv=False):
-    start_time = time.time()
-    timeout = aiohttp.ClientTimeout(total=20)
-
-    print(
-        f"{Fore.LIGHTYELLOW_EX}[!] Searching '{username}' across {len(searchData['sites'])} social networks\033[0m"
+def initiate():
+    if not os.path.exists("logs/"):
+        os.makedirs("logs/")
+    logging.basicConfig(
+        filename=config.LOG_PATH,
+        level=logging.DEBUG,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
 
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        tasks = []
-        for u in searchData["sites"]:
-            task = asyncio.ensure_future(
-                makeRequest(session, u, username, interfaceType)
-            )
-            tasks.append(task)
-
-        results = await asyncio.gather(*tasks)
-        now = datetime.now().strftime("%m/%d/%Y %H:%M:%S")
-        executionTime = round(time.time() - start_time, 1)
-        userJson = {
-            "search-params": {
-                "username": username,
-                "sites-number": len(searchData["sites"]),
-                "date": now,
-                "execution-time": executionTime,
-            },
-            "sites": [],
-        }
-        for x in results:
-            userJson["sites"].append(x)
-        pathSave = os.path.join(path, "results", username + ".json")
-        userFile = open(pathSave, "w")
-        json.dump(userJson, userFile, indent=4, sort_keys=True)
-
-        print(
-            f"{Fore.LIGHTYELLOW_EX}[!] Search complete in {executionTime} seconds\033[0m"
-        )
-        print(f"{Fore.LIGHTYELLOW_EX}[!] Results saved to {username}.json\033[0m")
-
-        if flag_csv:
-            exportCsv(userJson)
-
-        return userJson
-
-
-async def makeRequest(session, u, username, interfaceType):
-    url = u["url"].format(username=username)
-    jsonBody = None
-    useragent = random.choice(useragents)
-    headers = {"User-Agent": useragent}
-    metadata = []
-    if "headers" in u:
-        headers.update(json.loads(u["headers"]))
-    if "json" in u:
-        jsonBody = u["json"].format(username=username)
-        jsonBody = json.loads(jsonBody)
-    try:
-        async with session.request(
-            u["method"], url, json=jsonBody, proxy=proxy, headers=headers, ssl=False
-        ) as response:
-            responseContent = await response.text()
-            if (
-                "content-type" in response.headers
-                and "application/json" in response.headers["Content-Type"]
-            ):
-                jsonData = await response.json()
-            else:
-                soup = BeautifulSoup(responseContent, "html.parser")
-
-            if eval(u["valid"]):
-                print(
-                    f'{Fore.LIGHTGREEN_EX}[+]\033[0m - #{u["id"]} {Fore.BLUE}{u["app"]}\033[0m {Fore.LIGHTGREEN_EX}account found\033[0m - {Fore.YELLOW}{url}\033[0m [{response.status} {response.reason}]\033[0m'
-                )
-                if "metadata" in u:
-                    metadata = []
-                    for d in u["metadata"]:
-                        try:
-                            value = eval(d["value"]).strip("\t\r\n")
-                            print(f"   |--{d['key']}: {value}")
-                            metadata.append(
-                                {"type": d["type"], "key": d["key"], "value": value}
-                            )
-                        except Exception as e:
-                            pass
-                return {
-                    "id": u["id"],
-                    "app": u["app"],
-                    "url": url,
-                    "response-status": f"{response.status} {response.reason}",
-                    "status": "FOUND",
-                    "error-message": None,
-                    "metadata": metadata,
-                }
-            else:
-                if interfaceType == "CLI":
-                    if showAll:
-                        print(
-                            f'[-]\033[0m - #{u["id"]} {Fore.BLUE}{u["app"]}\033[0m account not found - {Fore.YELLOW}{url}\033[0m [{response.status} {response.reason}]\033[0m'
-                        )
-                return {
-                    "id": u["id"],
-                    "app": u["app"],
-                    "url": url,
-                    "response-status": f"{response.status} {response.reason}",
-                    "status": "NOT FOUND",
-                    "error-message": None,
-                    "metadata": metadata,
-                }
-    except Exception as e:
-        if interfaceType == "CLI":
-            if showAll:
-                print(
-                    f'{Fore.RED}[X]\033[0m - #{u["id"]} {Fore.BLUE}{u["app"]}\033[0m error on request ({repr(e)})- {Fore.YELLOW}{url}\033[0m'
-                )
-        return {
-            "id": u["id"],
-            "app": u["app"],
-            "url": url,
-            "response-status": None,
-            "status": "ERROR",
-            "error-message": repr(e),
-            "metadata": metadata,
-        }
-
-
-def list_sites():
-    for i, u in enumerate(searchData["sites"], 1):
-        print(f'{i}. {u["app"]}')
-
-
-def read_results(file):
-    try:
-        pathRead = os.path.join(path, "results", file)
-        f = open(pathRead, "r")
-        jsonD = json.load(f)
-        print(f"Loaded results file: {file}")
-        print(f"Username: {jsonD['search-params']['username']}")
-        print(f"Number of sites: {jsonD['search-params']['sites-number']}")
-        print(f"Date: {jsonD['search-params']['date']}")
-        print("-------------------------------------------------")
-        for u in jsonD["sites"]:
-            if u["status"] == "FOUND":
-                print(
-                    f'{Fore.LIGHTGREEN_EX}[+]\033[0m - {Fore.BLUE}{u["app"]}\033[0m {Fore.LIGHTGREEN_EX}account found\033[0m - {Fore.YELLOW}{u["url"]}\033[0m [{u["response-status"]}]\033[0m'
-                )
-                if u["metadata"]:
-                    for d in u["metadata"]:
-                        print(f"   |--{d['key']}: {d['value']}")
-            elif u["status"] == "ERROR":
-                print(
-                    f'{Fore.RED}[X]\033[0m - {Fore.BLUE}{u["app"]}\033[0m error on request ({u["error-message"]}) - {Fore.YELLOW}{u["url"]}\033[0m'
-                )
-            elif u["status"] == "NOT FOUND":
-                print(
-                    f'{Fore.WHITE}[-]\033[0m - {Fore.BLUE}{u["app"]}\033[0m account not found - {Fore.YELLOW}{u["url"]}\033[0m [{u["response-status"]}]\033[0m'
-                )
-
-    except Exception as e:
-        print(f"{Fore.RED}[X] Error reading file [{repr(e)}]")
-
-
-def exportCsv(userJson):
-    pathSave = os.path.join(
-        path, "results", userJson["search-params"]["username"] + ".csv"
+    parser = argparse.ArgumentParser(
+        prog="blackbird",
+        description="An OSINT tool to search for accounts by username in social networks.",
     )
-    with open(pathSave, "w", newline="", encoding="utf-8") as file:
-        writer = csv.writer(file)
-        writer.writerow(["ID", "App", "URL", "response-status", "metadata", "result"])
-
-        for u in userJson["sites"]:
-            writer.writerow(
-                [
-                    u["id"],
-                    u["app"],
-                    u["url"],
-                    u["response-status"],
-                    json.dumps(u["metadata"]),
-                    u["status"],
-                ]
-            )
-    print(
-        f"{Fore.LIGHTYELLOW_EX}[!] Results saved to {userJson['search-params']['username']}.csv\033[0m"
+    parser.add_argument(
+        "-u",
+        "--username",
+        nargs="*",
+        type=str,
+        help="One or more usernames to search.",
     )
-    return True
+    parser.add_argument(
+        "-uf",
+        "--username-file",
+        help="The list of usernames to be searched.",
+    )
+    parser.add_argument(
+        "--permute",
+        action="store_true",
+        help="Permute usernames, ignoring single elements.",
+    )
+    parser.add_argument(
+        "--permuteall", action="store_true", help="Permute usernames, all elements."
+    )
+    parser.add_argument(
+        "-e",
+        "--email",
+        nargs="*",
+        type=str,
+        help="One or more email to search.",
+    )
+    parser.add_argument(
+        "-ef",
+        "--email-file",
+        help="The list of emails to be searched.",
+    )
+    parser.add_argument(
+        "--csv",
+        default=False,
+        action=argparse.BooleanOptionalAction,
+        help="Generate a CSV with the results.",
+    )
+    parser.add_argument(
+        "--pdf",
+        default=False,
+        action=argparse.BooleanOptionalAction,
+        help="Generate a PDF with the results.",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        default=False,
+        action=argparse.BooleanOptionalAction,
+        help="Show verbose output.",
+    )
+    parser.add_argument(
+        "-ai",
+        "--ai",
+        default=False,
+        action=argparse.BooleanOptionalAction,
+        help="Extract Metadata with AI.",
+    )
+    parser.add_argument(
+        "--filter",
+        help='Filter sites to be searched by list property value.E.g --filter "cat=social"',
+    )
+    parser.add_argument(
+        "--no-nsfw", action="store_true", help="Removes NSFW sites from the search."
+    )
+    parser.add_argument(
+        "--dump", action="store_true", help="Dump HTML content for found accounts."
+    )
+    parser.add_argument("--proxy", help="Proxy to send HTTP requests though.")
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=30,
+        help="Timeout in seconds for each HTTP request (Default is 30).",
+    )
+    parser.add_argument(
+        "--max-concurrent-requests",
+        type=int,
+        default=30,
+        help="Specify the maximum number of concurrent requests allowed. Default is 30.",
+    )
+    parser.add_argument(
+        "--no-update", action="store_true", help="Don't update sites lists."
+    )
+    parser.add_argument(
+        "--about", action="store_true", help="Show about information and exit."
+    )
+    args = parser.parse_args()
+
+    # Store the necessary arguments to config Object
+    config.username = args.username
+    config.username_file = args.username_file
+    config.permute = args.permute
+    config.permuteall = args.permuteall
+    config.csv = args.csv
+    config.pdf = args.pdf
+    config.filter = args.filter
+    config.no_nsfw = args.no_nsfw
+    config.dump = args.dump
+    config.proxy = args.proxy
+    config.verbose = args.verbose
+    config.ai = args.ai
+    config.timeout = args.timeout
+    config.max_concurrent_requests = args.max_concurrent_requests
+    config.email = args.email
+    config.email_file = args.email_file
+    config.no_update = args.no_update
+    config.about = args.about
+    config.instagram_session_id = os.getenv("INSTAGRAM_SESSION_ID")
+
+    config.console = Console()
+
+    config.dateRaw = datetime.now().strftime("%m_%d_%Y")
+    config.datePretty = datetime.now().strftime("%B %d, %Y")
+
+    config.userAgent = getRandomUserAgent(config)
+
+    config.usernameFoundAccounts = None
+    config.emailFoundAccounts = None
+
+    config.currentUser = None
+    config.currentEmail = None
 
 
 if __name__ == "__main__":
-    init()
-
-    print(
-        Fore.RED
-        + """
+    initiate()
+    config.console.print(
+        """[red]
     ▄▄▄▄    ██▓    ▄▄▄       ▄████▄   ██ ▄█▀ ▄▄▄▄    ██▓ ██▀███  ▓█████▄ 
     ▓█████▄ ▓██▒   ▒████▄    ▒██▀ ▀█   ██▄█▒ ▓█████▄ ▓██▒▓██ ▒ ██▒▒██▀ ██▌
     ▒██▒ ▄██▒██░   ▒██  ▀█▄  ▒▓█    ▄ ▓███▄░ ▒██▒ ▄██▒██▒▓██ ░▄█ ▒░██   █▌
@@ -227,76 +175,93 @@ if __name__ == "__main__":
     ░          ░  ░     ░  ░░ ░      ░  ░    ░       ░     ░        ░    
         ░                  ░                     ░               ░      
 
-                                        Made with ❤️️ by """
-        + Fore.BLUE
-        + "p1ngul1n0\n"
+    [/red]"""
+    )
+    config.console.print(
+        "           [white]Made with :beating_heart: by [red]Lucas 'P1ngul1n0' Antoniaci[/red] [/white]"
     )
 
-    parser = argparse.ArgumentParser(
-        description="An OSINT tool to search for accounts by username in social networks."
-    )
-    parser.add_argument(
-        "-u",
-        action="store",
-        dest="username",
-        required=False,
-        help="The target username.",
-    )
-    parser.add_argument(
-        "--list-sites",
-        action="store_true",
-        dest="list",
-        required=False,
-        help="List all sites currently supported.",
-    )
-    parser.add_argument(
-        "-f", action="store", dest="file", required=False, help="Read results file."
-    )
-    parser.add_argument(
-        "--web", action="store_true", dest="web", required=False, help="Run webserver."
-    )
-    parser.add_argument(
-        "--proxy",
-        action="store",
-        dest="proxy",
-        required=False,
-        help="Proxy to send requests through.E.g: --proxy http://127.0.0.1:8080 ",
-    )
-    parser.add_argument(
-        "--show-all",
-        action="store_true",
-        dest="showAll",
-        required=False,
-        help="Show all results.",
-    )
-    parser.add_argument(
-        "--csv",
-        action="store_true",
-        dest="csv",
-        required=False,
-        help="Export results to CSV file.",
-    )
-    arguments = parser.parse_args()
+    if config.about:
+        config.console.print(
+            """
+        Author: Lucas Antoniaci (p1ngul1n0)
+        Description: Blackbird is an OSINT tool that perform reverse search in username and emails.
+        About WhatsMyName Project: This tool search for accounts using data from the WhatsMyName project, which is an open-source tool developed by WebBreacher. WhatsMyName License: The WhatsMyName project is licensed under the Creative Commons Attribution-ShareAlike 4.0 International License (CC BY-SA 4.0). More details (https://github.com/WebBreacher/WhatsMyName)
+        """
+        )
+        sys.exit()
 
-    if arguments.proxy:
-        proxy = arguments.proxy
-    showAll = False
-    if arguments.showAll:
-        showAll = arguments.showAll
+    if (
+        not config.username
+        and not config.email
+        and not config.username_file
+        and not config.email_file
+    ):
+        config.console.print("Either --username or --email is required")
+        sys.exit()
+    if not config.username and (config.permute or config.permuteall):
+        config.console.print("Permutations requires --username")
+        sys.exit()
 
-    if arguments.web:
-        print("[!] Started WebServer on http://127.0.0.1:9797/")
-        command = subprocess.run((sys.executable, "webserver.py"))
-        command.check_returncode()
+    if config.no_update:
+        config.console.print(":next_track_button:  Skipping update...")
+    else:
+        checkUpdates(config)
 
-    if arguments.username:
-        try:
-            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-        except:
-            pass
-        interfaceType = "CLI"
-        asyncio.run(findUsername(arguments.username, interfaceType, arguments.csv))
-    elif arguments.list:
-        list_sites()
-    elif arguments.file:
-        read_results(arguments.file)
+    if config.ai:
+        inialize_nlp_model(config)
+        config.aiModel = True
+
+    if config.username_file:
+        if isFile(config.username_file):
+            config.username = getLinesFromFile(config.username_file)
+            config.console.print(
+                f':glasses: Successfully loaded {len(config.username)} usernames from "{config.username_file}"'
+            )
+        else:
+            config.console.print(f'❌ Could not read file "{config.username_file}"')
+            sys.exit()
+
+    if config.username:
+        if (config.permute or config.permuteall) and len(config.username) > 1:
+            elements = " ".join(config.username)
+            way = "all" if config.permuteall else "strict"
+            permute = Permute(config.username)
+            config.username = permute.gather(way)
+            config.console.print(
+                f":glasses: Successfully loaded {len(config.username)} usernames from permuting {elements}"
+            )
+        for user in config.username:
+            config.currentUser = user
+            if config.dump or config.csv or config.pdf:
+                createSaveDirectory(config)
+            verifyUsername(config.currentUser, config)
+            if config.csv and config.usernameFoundAccounts:
+                saveToCsv(config.usernameFoundAccounts, config)
+            if config.pdf and config.usernameFoundAccounts:
+                saveToPdf(config.usernameFoundAccounts, "username", config)
+            config.currentUser = None
+            config.usernameFoundAccounts = None
+
+    if config.email_file:
+        if isFile(config.email_file):
+            config.email = getLinesFromFile(config.email_file)
+            config.console.print(
+                f':glasses: Successfully loaded {len(config.email)} emails from "{config.email_file}"'
+            )
+        else:
+            config.console.print(f'❌ Could not read file "{config.email_file}"')
+            sys.exit()
+
+    if config.email:
+        for email in config.email:
+            config.currentEmail = email
+            if config.dump or config.csv or config.pdf:
+                createSaveDirectory(config)
+            verifyEmail(email, config)
+            if config.csv and config.emailFoundAccounts:
+                saveToCsv(config.emailFoundAccounts, config)
+            if config.pdf and config.emailFoundAccounts:
+                saveToPdf(config.emailFoundAccounts, "email", config)
+            config.currentEmail = None
+            config.emailFoundAccounts = None
